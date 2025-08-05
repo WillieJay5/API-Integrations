@@ -1,0 +1,113 @@
+name: Test API Trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      callerId:
+        description: 'ID of the caller'
+        required: true
+        type: string
+      message:
+        description: 'A message string'
+        required: false
+        type: string
+
+jobs:
+  process_api_data:
+    runs-on: ubuntu-latest
+    env:
+      # Define your API endpoint as a secret
+      # This should be the base URL for your API server
+      EXTERNAL_API_SERVER: ${{ secrets.EXTERNAL_API_SERVER }}
+      EXTERNAL_API_KEY: ${{ secrets.EXTERNAL_API_KEY }} # If your API requires an API key
+      # Define the specific API path/directory to append to the base URL
+      USER_API_PATH: /v1/users # <--- Ensure this matches your actual API path
+
+      # NEW: Define secrets for your external target API (where you're sending the POST request)
+      EXTERNAL_TARGET_API_URL: ${{ secrets.EXTERNAL_TARGET_API_URL }}
+      EXTERNAL_TARGET_API_KEY: ${{ secrets.EXTERNAL_TARGET_API_KEY }} # If your target API requires an API key
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Display received inputs
+        run: |
+          echo "Workflow triggered successfully!"
+          echo "Received Caller ID: ${{ github.event.inputs.callerId }}"
+          echo "Received Message: ${{ github.event.inputs.message || 'No message provided' }}"
+
+      - name: Make API Request and Process Data
+        id: process_data
+        run: |
+          # Define your list of on-call emails (comma-separated for easy splitting)
+          # IMPORTANT: For production, this should be stored in a GitHub Secret:
+          # Go to your repository settings -> Secrets and variables -> Actions -> New repository secret
+          # Name: ON_CALL_EMAILS_LIST
+          # Value: email1@example.com,email2@example.com,email3@example.com
+          ON_CALL_EMAILS="${{ secrets.ON_CALL_EMAILS_LIST }}"
+          echo "On-call list: $ON_CALL_EMAILS"
+
+          # Construct the full API URL by combining the base server URL and the path
+          FULL_API_URL="${{ env.EXTERNAL_API_SERVER }}${{ env.USER_API_PATH }}"
+          echo "Making API call to: $FULL_API_URL"
+
+          # Make the API call
+          API_RESPONSE=$(curl -s -X GET "${FULL_API_URL}" \
+            -H "Authorization: Bearer ${{ env.EXTERNAL_API_KEY }}" \
+            -H "Content-Type: application/json")
+
+          echo "API Response: $API_RESPONSE"
+
+           MATCHED_USER_JSON=$(echo "$API_RESPONSE" | jq -r --arg on_call_emails "$ON_CALL_EMAILS" '
+            .data[] |
+            select(.email | IN($on_call_emails | split(",") | .[] | sub("^[ ]*";"") | sub("[ ]*$";""))) |
+            {id: .id, email: .email, name: .name} |
+            tostring
+          ' | head -n 1) # Take only the first match if multiple exist
+
+          MATCHED_EMAIL=""
+          MATCHED_ID=""
+          MATCHED_NAME=""
+
+          if [ -n "$MATCHED_USER_JSON" ] && [ "$MATCHED_USER_JSON" != "null" ]; then
+            # Parse the JSON string if a match was found
+            MATCHED_EMAIL=$(echo "$MATCHED_USER_JSON" | jq -r '.email')
+            MATCHED_ID=$(echo "$MATCHED_USER_JSON" | jq -r '.id')
+            MATCHED_NAME=$(echo "$MATCHED_USER_JSON" | jq -r '.name')
+
+            echo "::notice file=$GITHUB_WORKFLOW::Matched On-Call User: $MATCHED_NAME ($MATCHED_EMAIL), ID: $MATCHED_ID"
+            echo "matched_email=$MATCHED_EMAIL" >> $GITHUB_OUTPUT
+            echo "matched_id=$MATCHED_ID" >> $GITHUB_OUTPUT
+            echo "matched_name=$MATCHED_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "::warning file=$GITHUB_WORKFLOW::No on-call email found in API response data."
+            # Consider sending a notification or failing the job if no match is critical
+            # exit 1 # Uncomment this line to fail the job if no match
+          fi
+
+          
+      - name: Send Post Request Using Matched Data
+        if: steps.process_data.outputs.matched_id != ''
+        run: |
+          echo "Performing action for matched user:"
+          echo "Email: ${{ steps.process_data.outputs.matched_email }}"
+          echo "ID: ${{ steps.process_data.outputs.matched_id }}"
+          echo "Name: ${{ steps.process_data.outputs.matched_name }}"
+
+          # Construct the full API URL for the POST request  
+          FULL_API_URL="${{ env.EXTERNAL_API_SERVER }}${{ env.SCENARIO_PATH }}"
+          echo "Making API call to: $FULL_API_URL"
+
+          
+          # Make the HTTP POST request to your external target API
+          # IMPORTANT: Replace with your actual notification API endpoint and payload structure
+          curl -L -X POST "https://api.icmobile.singlewire.com/api/v1/scenario-notifications" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ env.EXTERNAL_API_KEY }}" \
+            -d '{
+            "messages": [{
+              "messageId" : "75f5c88c-6418-11f0-9b96-612844954b79",
+              "userIds": ["${{ steps.process_data.outputs.matched_id }}"]  
+            }],
+            "scenarioId": "75e10808-6418-11f0-9b96-353a9830a60e"}'
